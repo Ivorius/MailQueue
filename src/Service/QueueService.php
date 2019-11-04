@@ -13,6 +13,8 @@ class QueueService extends \Nette\Object {
 
 	const MUTEX_TIME_FORMAT = DATE_W3C;
 
+	const PARAMETER_NAME_MAIL_QUEUE_ENTRY_ID = 'mailQueueEntry_id';
+
 	/** @var string */
 	protected $queueEntryClass;
 
@@ -43,6 +45,12 @@ class QueueService extends \Nette\Object {
 	/** @var int */
 	protected $lockTimeout;
 
+	/** @var \ADT\BackgroundQueue\Service */
+	protected $backgroundQueueService;
+
+	/** @var string */
+	protected $backgroundQueueCallbackName;
+
 	public function __construct($config, \Kdyby\Doctrine\EntityManager $em) {
 		if (! is_dir($config['tempDir'])) {
 			mkdir($config['tempDir']);	
@@ -55,6 +63,9 @@ class QueueService extends \Nette\Object {
 		$this->queueEntryClass = $config['queueEntityClass'];
 		$this->em = $em;
 		$this->logger = \Tracy\Debugger::getLogger();
+
+		$this->backgroundQueueService = $config['backgroundQueueService'];
+		$this->backgroundQueueCallbackName = $config['backgroundQueueCallbackName'];
 	}
 
 	public function setMailer(\Nette\Mail\IMailer $mailer) {
@@ -97,6 +108,27 @@ class QueueService extends \Nette\Object {
 	}
 
 	/**
+	 * @param Entity\AbstractMailQueueEntry $entry
+	 * @return mixed
+	 * @throws \Doctrine\ORM\ORMException
+	 * @throws \Doctrine\ORM\OptimisticLockException
+	 */
+	protected function createRabbitQueueEntry(Entity\AbstractMailQueueEntry $entry) {
+		$entityName = $this->backgroundQueueService->getEntityClass();
+		$entity = new $entityName;
+		$entity->setCallbackName($this->backgroundQueueCallbackName);
+		$entity->setParameters([self::PARAMETER_NAME_MAIL_QUEUE_ENTRY_ID => $entry->getId()]);
+		$this->em->persist($entry);
+		$this->em->flush($entry);
+
+		$this->backgroundQueueService->publish($entity);
+
+		return $entity;
+	}
+
+
+
+	/**
 	 * @param \Nette\Mail\Message $message
 	 * @param array|callable $custom
 	 * @return Entity\AbstractMailQueueEntry
@@ -105,73 +137,10 @@ class QueueService extends \Nette\Object {
 		$entry = $this->createQueueEntry($message, $custom);
 		$this->em->persist($entry);
 		$this->em->flush($entry);
+
+		$this->createRabbitQueueEntry($entry);
+
 		return $entry;
-	}
-
-	protected function mutexLock(OutputInterface $output = NULL) {
-		$now = new \DateTime;
-
-		if ($output) {
-			$output->write('Locking mutex ...');
-		}
-
-		// DISCLAIMER: This is NOT atomic mutex!
-		// It is all we have right now and it should be enough for our purpose but in case it is not,
-		// just make sure the "read, increment, write" operation is atomic and everything should work just fine.
-		file_put_contents($this->mutexFile, $mutexValue = ((@file_get_contents($this->mutexFile) ?: 0) + 1)); // @ - file may not exist
-
-		if ($mutexValue !== 1) {
-			if ($output) {
-				$output->writeln(' already locked');
-			}
-
-			if ($this->lockTimeout > 0) {
-				$mutexCreatedAt = \DateTime::createFromFormat(static::MUTEX_TIME_FORMAT, @file_get_contents($this->mutexTimeFile)); // @ - file may not exist
-
-				if (!$mutexCreatedAt) {
-					$unlock = TRUE;
-
-					if ($output) {
-						$output->writeln('Mutex has been locked but timestamp is invalid');
-					}
-				} else {
-					$mutexLockedFor = $now->getTimestamp() - $mutexCreatedAt->getTimestamp();
-					$unlock = $mutexLockedFor >= $this->lockTimeout;
-
-					if ($output) {
-						$output->writeln('Mutex has been locked for ' . $mutexLockedFor . ' seconds');
-					}
-				}
-
-				if ($unlock) {
-					$this->mutexUnlock($output);
-					return $this->mutexLock($output);
-				}
-			}
-
-			return FALSE;
-		}
-
-		// store lock creation time
-		file_put_contents($this->mutexTimeFile, $now->format(static::MUTEX_TIME_FORMAT));
-
-		if ($output) {
-			$output->writeln(' done');
-		}
-
-		return TRUE;
-	}
-
-	protected function mutexUnlock(OutputInterface $output = NULL) {
-		if ($output) {
-			$output->write('Unlocking mutex ...');
-		}
-		// @ - files may not exist
-		@unlink($this->mutexFile);
-		@unlink($this->mutexTimeFile);
-		if ($output) {
-			$output->writeln(' done');
-		}
 	}
 
 	protected function send(Entity\AbstractMailQueueEntry $entry) {
@@ -182,89 +151,55 @@ class QueueService extends \Nette\Object {
 		}
 	}
 
-	public function process(OutputInterface $output = NULL) {
-		if (!$this->mutexLock($output)) {
-			// mutex is already locked
-			return FALSE;
-		}
+	/**
+	 * @param \ADT\BackgroundQueue\Entity\QueueEntity $entity
+	 * @return bool
+	 *
+	 * new_rabbit
+	 */
+	public function process(\ADT\BackgroundQueue\Entity\QueueEntity $entity) {
+		$parameters = $entity->getParameters();
+		$entryId = $parameters[self::PARAMETER_NAME_MAIL_QUEUE_ENTRY_ID];
+		$entry = $this->em->find($this->queueEntryClass, $entryId);
 
-		$undeliveredCriteria = [ 'sentAt' => NULL ];
-		$orderBy = [ 'createdAt' => 'ASC' ];
-		$repo = $this->em->getRepository($this->queueEntryClass);
-		$count = min($repo->countBy($undeliveredCriteria), 1000);
-		$errors = [];
 
-		if ($count) {
-			/** @var Entity\AbstractMailQueueEntry[] $entries */
-			$entries = $repo->findBy($undeliveredCriteria, $orderBy, $count);
+		try {
+			$this->send($entry);
+			$entry->sentAt = new \DateTime;
+		} catch (\Exception $e) {
+			$msg = $e->getMessage();
 
-			foreach ($entries as $counter => $entry) {
-				if ($output) {
-					$output->write("\r" . 'Sending message ' . (1 + $counter) . ' out of ' . $count);
-				}
-
-				try {
-					$this->send($entry);
-					$entry->sentAt = new \DateTime;
-				} catch (\Exception $e) {
-					$msg = $e->getMessage();
-
-					if ($e->getPrevious()) {
-						$msg .= " (" . $e->getPrevious()->getMessage() . ")";
-					}
-
-					if ($this->sendErrorHandler) {
-						$sendException = $e instanceof \Nette\Mail\SendException
-							? $e
-							: new \Nette\Mail\SendException($msg, $e->getCode(), $e);
-
-						$errorHandlerResponse = call_user_func($this->sendErrorHandler, $entry, $sendException);
-
-						if (is_string($errorHandlerResponse)) {
-							// error handled but should be logged
-							$msg .= '; ' . $errorHandlerResponse;
-						} else if ($errorHandlerResponse === NULL) {
-							// error not handled
-						} else {
-							// error handled gracefully
-							$msg = NULL;
-						}
-					}
-
-					if ($msg !== NULL) {
-						// mail report
-						$errors[] = 'Message ' . (1 + $counter) . '/' . $count . '; id=' . $entry->getId() . ': ' . $msg;
-
-						// CLI report
-						if ($output) {
-							$output->write('; error: ' . $msg);
-
-							if (count($entries) - 1 > $counter) {
-								$output->writeln('');
-							}
-						}
-					}
-				}
-
-				$this->em->persist($entry);
-				$this->em->flush($entry);
+			if ($e->getPrevious()) {
+				$msg .= " (" . $e->getPrevious()->getMessage() . ")";
 			}
 
-			if ($output) {
-				$output->writeln('');
+			if ($this->sendErrorHandler) {
+				$sendException = $e instanceof \Nette\Mail\SendException
+					? $e
+					: new \Nette\Mail\SendException($msg, $e->getCode(), $e);
+
+				$errorHandlerResponse = call_user_func($this->sendErrorHandler, $entry, $sendException);
+
+				if (is_string($errorHandlerResponse)) {
+					// error handled but should be logged
+					$msg .= '; ' . $errorHandlerResponse;
+				} else if ($errorHandlerResponse === NULL) {
+					// error not handled
+				} else {
+					// error handled gracefully
+					$msg = NULL;
+				}
 			}
-		} else if ($output) {
-			$output->writeln('No undelivered message found.');
+
+			if ($msg !== NULL) {
+				// mail report
+				$error = 'id=' . $entry->getId() . ': ' . $msg;
+				$this->logger->log($error, \Tracy\Logger::ERROR);
+			}
 		}
 
-		$this->mutexUnlock($output);
-
-		if ($errors) {
-			$errors = implode(PHP_EOL, $errors);
-			$this->logger->log($errors, \Tracy\Logger::ERROR);
-		}
-
-		$this->onQueueDrained($output);
+		$this->em->persist($entry);
+		$this->em->flush($entry);
 
 		return TRUE;
 	}

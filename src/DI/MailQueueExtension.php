@@ -19,6 +19,8 @@ class MailQueueExtension extends \Nette\DI\CompilerExtension {
 			'onQueueDrained' => NULL,
 			'lockTimeout' => 600,
 			'tempDir' => $this->getContainerBuilder()->parameters['tempDir'],
+			'backgroundQueueService' => NULL,
+			'backgroundQueueCallbackName' => NULL,
 		]);
 
 		if (!empty($config['messenger']) && !empty($config['mailer'])) {
@@ -31,6 +33,14 @@ class MailQueueExtension extends \Nette\DI\CompilerExtension {
 
 		if (!is_a($config['queueEntityClass'], Entity\AbstractMailQueueEntry::class, TRUE)) {
 			throw new \Nette\InvalidArgumentException('Invalid Queue entity class.');
+		}
+
+		if (empty($config['backgroundQueueService'])) {
+			throw new \Nette\InvalidArgumentException('You have to set "backgroundQueueService". E.g. "@ADT\BackgroundQueue\Service".');
+		}
+
+		if (empty($config['backgroundQueueCallbackName'])) {
+			throw new \Nette\InvalidArgumentException('You have to set "backgroundQueueCallbackName". E.g. "mailSending".');
 		}
 
 		// Queue service
